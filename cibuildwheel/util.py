@@ -223,6 +223,7 @@ class BuildOptions(NamedTuple):
     test_extras: str
     build_verbosity: int
     build_frontend: BuildFrontend
+    cross_compile_archs: tuple
 
 
 class NonPlatformWheelError(Exception):

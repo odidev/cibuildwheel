@@ -16,6 +16,13 @@ from .util import (
     prepare_command,
     read_python_configs,
 )
+from .cross_compile import (
+    TargetArchEnvUtil,
+    native_docker_images,
+    setup_qemu,
+    xc_execute_cmd,
+    platform_tag_to_arch,
+)
 
 
 class PythonConfiguration(NamedTuple):
@@ -66,6 +73,7 @@ def build(options: BuildOptions) -> None:
         ("cp", "manylinux_x86_64", options.manylinux_images["x86_64"]),
         ("cp", "manylinux_i686", options.manylinux_images["i686"]),
         ("cp", "manylinux_aarch64", options.manylinux_images["aarch64"]),
+        ("xc", "manylinux_aarch64", options.manylinux_images["xc_aarch64"]),
         ("cp", "manylinux_ppc64le", options.manylinux_images["ppc64le"]),
         ("cp", "manylinux_s390x", options.manylinux_images["s390x"]),
         ("pp", "manylinux_x86_64", options.manylinux_images["pypy_x86_64"]),
@@ -82,7 +90,15 @@ def build(options: BuildOptions) -> None:
     container_package_dir = container_project_path / abs_package_dir.relative_to(cwd)
     container_output_dir = PurePath("/output")
 
+    if options.cross_compile_archs:
+        print("\nRegistering qemu to run ppc64le/AArch64 docker containers...\n")
+        setup_qemu()
+
     for implementation, platform_tag, docker_image in platforms:
+
+        if options.cross_compile_archs and platform_tag.endswith(options.cross_compile_archs) and implementation is not 'xc':
+            continue
+
         platform_configs = [
             c
             for c in python_configurations
@@ -93,6 +109,7 @@ def build(options: BuildOptions) -> None:
 
         try:
             log.step(f"Starting Docker image {docker_image}...")
+            cross_compilation = True if options.cross_compile_archs and implementation is 'xc' else False
             with DockerContainer(
                 docker_image,
                 simulate_32_bit=platform_tag.endswith("i686"),
@@ -101,6 +118,8 @@ def build(options: BuildOptions) -> None:
 
                 log.step("Copying project into Docker...")
                 docker.copy_into(Path.cwd(), container_project_path)
+                if  cross_compilation is True:
+                    target_arch = platform_tag_to_arch(platform_tag)
 
                 if options.before_all:
                     log.step("Running before_all...")
@@ -117,9 +136,12 @@ def build(options: BuildOptions) -> None:
                         project=container_project_path,
                         package=container_package_dir,
                     )
-                    docker.call(["sh", "-c", before_all_prepared], env=env)
-
+                    if  cross_compilation is True:
+                        xc_execute_cmd(docker, before_all_prepared, False, target_arch, env)
+                    else:
+                        docker.call(["sh", "-c", before_all_prepared], env=env)
                 for config in platform_configs:
+
                     log.build_start(config.identifier)
 
                     dependency_constraint_flags: List[PathOrStr] = []
@@ -140,6 +162,11 @@ def build(options: BuildOptions) -> None:
                     # put this config's python top of the list
                     python_bin = config.path / "bin"
                     env["PATH"] = f'{python_bin}:{env["PATH"]}'
+                    if  cross_compilation is True:
+                        cross_py = str(config.path)
+                        build_py = cross_py[:cross_py.rindex("/")]
+                        build_py_bin = f'{build_py}/bin'
+                        env['PATH'] = f'{build_py_bin}:{env["PATH"]}'
 
                     env = options.environment.as_dictionary(
                         env, executor=docker.environment_executor
@@ -171,7 +198,10 @@ def build(options: BuildOptions) -> None:
                             project=container_project_path,
                             package=container_package_dir,
                         )
-                        docker.call(["sh", "-c", before_build_prepared], env=env)
+                        if  cross_compilation is True:
+                            xc_execute_cmd(docker, before_build_prepared, True, target_arch, env)
+                        else:
+                            docker.call(["sh", "-c", before_build_prepared], env=env)
 
                     log.step("Building wheel...")
 
@@ -182,7 +212,20 @@ def build(options: BuildOptions) -> None:
 
                     verbosity_flags = get_build_verbosity_extra_flags(options.build_verbosity)
 
-                    if options.build_frontend == "pip":
+                    if cross_compilation is True:
+                        # pip wheel is not working properly with crossenv, use "bdist_wheel" for now
+                        docker.call(
+                            [
+                                "python",
+                                "setup.py",
+                                "bdist_wheel",
+                                f"--dist-dir={built_wheel_dir}",
+                                *verbosity_flags,
+                            ],
+                            env=env,
+                            cwd=container_package_dir,
+                        )
+                    elif options.build_frontend == "pip":
                         docker.call(
                             [
                                 "python",
@@ -216,81 +259,174 @@ def build(options: BuildOptions) -> None:
                     built_wheel = docker.glob(built_wheel_dir, "*.whl")[0]
 
                     repaired_wheel_dir = temp_dir / "repaired_wheel"
+                    if  cross_compilation is True:
+                        target_arch_env=TargetArchEnvUtil(env, target_arch)
+                        # Because we will repair the wheel in a different container, we need to
+                        # changing the path with respect host machine. We will copy the built
+                        # wheels on host machine before accessing these
+                        built_wheel = PurePath(target_arch_env.host + built_wheel.__str__());
+                        repaired_wheel_dir = PurePath(target_arch_env.host + repaired_wheel_dir.__str__())
+
                     docker.call(["rm", "-rf", repaired_wheel_dir])
                     docker.call(["mkdir", "-p", repaired_wheel_dir])
 
                     if built_wheel.name.endswith("none-any.whl"):
                         raise NonPlatformWheelError()
 
-                    if options.repair_command:
-                        log.step("Repairing wheel...")
-                        repair_command_prepared = prepare_command(
-                            options.repair_command, wheel=built_wheel, dest_dir=repaired_wheel_dir
-                        )
-                        docker.call(["sh", "-c", repair_command_prepared], env=env)
+                    if  cross_compilation is True:
+                        # We will repair the wheel in a different environment, copy the
+                        # built wheels back on host machine alog with the script used to
+                        # repair the wheel
+                        docker.call(['cp', '-r', temp_dir, target_arch_env.host_machine_tmp_in_container])
+                        docker.call(['cp', target_arch_env.tmp + '/repair_wheel.sh', target_arch_env.host_machine_tmp_in_container])
+                        with DockerContainer(native_docker_images[target_arch], simulate_32_bit=platform_tag.endswith('i686'), cwd=container_project_path) as xc_docker:
+                            if options.repair_command:
+                                log.step("Repairing wheel...")
+                                repair_command_prepared = prepare_command(
+                                    options.repair_command, wheel=built_wheel, dest_dir=repaired_wheel_dir
+                                )
+                                # Repair the wheel in a architecture specific container
+                                xc_docker.call([target_arch_env.host_machine_tmp_in_container+'/repair_wheel.sh', target_arch_env.host_machine_deps_in_container, repair_command_prepared])
+                            else:
+                                xc_docker.call(["mv", built_wheel, repaired_wheel_dir])
+                            repaired_wheels = xc_docker.glob(repaired_wheel_dir, "*.whl")
+
+                            if options.test_command and options.test_selector(config.identifier):
+                                log.step("Testing wheel...")
+
+                                # We are testing in a different container so we need to copy the
+                                # project and constraints file into it.
+                                xc_docker.copy_into(Path.cwd(), container_project_path)
+                                xc_docker.copy_into(constraints_file, container_constraints_file)
+
+                                # Setting the path to current python version
+                                envxc = xc_docker.get_environment()
+                                path=env['PATH'].replace('-xc', '')
+                                envxc['PATH']=f'{path}:envxc["PATH"]'
+
+                                # set up a virtual environment to install and test from, to make sure
+                                # there are no dependencies that were pulled in at build time.
+                                xc_docker.call(
+                                    ["pip", "install", "virtualenv", *dependency_constraint_flags], env=envxc
+                                )
+                                venv_dir = (
+                                    PurePath(xc_docker.call(["mktemp", "-d"], capture_output=True).strip())
+                                    / "venv"
+                                )
+
+                                xc_docker.call(
+                                    ["python", "-m", "virtualenv", "--no-download", venv_dir], env=envxc
+                                )
+
+                                virtualenv_env = envxc.copy()
+                                virtualenv_env["PATH"] = f"{venv_dir / 'bin'}:{virtualenv_env['PATH']}"
+
+                                if options.before_test:
+                                    before_test_prepared = prepare_command(
+                                        options.before_test,
+                                        project=container_project_path,
+                                        package=container_package_dir,
+                                    )
+                                    xc_docker.call(["sh", "-c", before_test_prepared], env=virtualenv_env)
+
+                                # Install the wheel we just built
+                                # Note: If auditwheel produced two wheels, it's because the earlier produced wheel
+                                # conforms to multiple manylinux standards. These multiple versions of the wheel are
+                                # functionally the same, differing only in name, wheel metadata, and possibly include
+                                # different external shared libraries. so it doesn't matter which one we run the tests on.
+                                # Let's just pick the first one.
+                                wheel_to_test = repaired_wheels[0]
+                                xc_docker.call(
+                                    ["pip", "install", str(wheel_to_test) + options.test_extras],
+                                    env=virtualenv_env,
+                                )
+
+                                # Install any requirements to run the tests
+                                if options.test_requires:
+                                    xc_docker.call(
+                                        ["pip", "install", *options.test_requires], env=virtualenv_env
+                                    )
+
+                                # Run the tests from a different directory
+                                test_command_prepared = prepare_command(
+                                    options.test_command,
+                                    project=container_project_path,
+                                    package=container_package_dir,
+                                )
+                                xc_docker.call(
+                                    ["sh", "-c", test_command_prepared], cwd="/root", env=virtualenv_env
+                                )
+
+                                # clean up test environment
+                                xc_docker.call(["rm", "-rf", venv_dir])
                     else:
-                        docker.call(["mv", built_wheel, repaired_wheel_dir])
-
-                    repaired_wheels = docker.glob(repaired_wheel_dir, "*.whl")
-
-                    if options.test_command and options.test_selector(config.identifier):
-                        log.step("Testing wheel...")
-
-                        # set up a virtual environment to install and test from, to make sure
-                        # there are no dependencies that were pulled in at build time.
-                        docker.call(
-                            ["pip", "install", "virtualenv", *dependency_constraint_flags], env=env
-                        )
-                        venv_dir = (
-                            PurePath(docker.call(["mktemp", "-d"], capture_output=True).strip())
-                            / "venv"
-                        )
-
-                        docker.call(
-                            ["python", "-m", "virtualenv", "--no-download", venv_dir], env=env
-                        )
-
-                        virtualenv_env = env.copy()
-                        virtualenv_env["PATH"] = f"{venv_dir / 'bin'}:{virtualenv_env['PATH']}"
-
-                        if options.before_test:
-                            before_test_prepared = prepare_command(
-                                options.before_test,
-                                project=container_project_path,
-                                package=container_package_dir,
+                        if options.repair_command:
+                            log.step("Repairing wheel...")
+                            repair_command_prepared = prepare_command(
+                                options.repair_command, wheel=built_wheel, dest_dir=repaired_wheel_dir
                             )
-                            docker.call(["sh", "-c", before_test_prepared], env=virtualenv_env)
+                            docker.call(["sh", "-c", repair_command_prepared], env=env)
+                        else:
+                            docker.call(["mv", built_wheel, repaired_wheel_dir])
 
-                        # Install the wheel we just built
-                        # Note: If auditwheel produced two wheels, it's because the earlier produced wheel
-                        # conforms to multiple manylinux standards. These multiple versions of the wheel are
-                        # functionally the same, differing only in name, wheel metadata, and possibly include
-                        # different external shared libraries. so it doesn't matter which one we run the tests on.
-                        # Let's just pick the first one.
-                        wheel_to_test = repaired_wheels[0]
-                        docker.call(
-                            ["pip", "install", str(wheel_to_test) + options.test_extras],
-                            env=virtualenv_env,
-                        )
-
-                        # Install any requirements to run the tests
-                        if options.test_requires:
+                        repaired_wheels = docker.glob(repaired_wheel_dir, "*.whl")
+                        if options.test_command and options.test_selector(config.identifier):
+                            log.step("Testing wheel...")
+                            # set up a virtual environment to install and test from, to make sure
+                            # there are no dependencies that were pulled in at build time.
                             docker.call(
-                                ["pip", "install", *options.test_requires], env=virtualenv_env
+                                ["pip", "install", "virtualenv", *dependency_constraint_flags], env=env
+                            )
+                            venv_dir = (
+                                PurePath(docker.call(["mktemp", "-d"], capture_output=True).strip())
+                                / "venv"
                             )
 
-                        # Run the tests from a different directory
-                        test_command_prepared = prepare_command(
-                            options.test_command,
-                            project=container_project_path,
-                            package=container_package_dir,
-                        )
-                        docker.call(
-                            ["sh", "-c", test_command_prepared], cwd="/root", env=virtualenv_env
-                        )
+                            docker.call(
+                                ["python", "-m", "virtualenv", "--no-download", venv_dir], env=env
+                            )
 
-                        # clean up test environment
-                        docker.call(["rm", "-rf", venv_dir])
+                            virtualenv_env = env.copy()
+                            virtualenv_env["PATH"] = f"{venv_dir / 'bin'}:{virtualenv_env['PATH']}"
+
+                            if options.before_test:
+                                before_test_prepared = prepare_command(
+                                    options.before_test,
+                                    project=container_project_path,
+                                    package=container_package_dir,
+                                )
+                                docker.call(["sh", "-c", before_test_prepared], env=virtualenv_env)
+
+                                # Install the wheel we just built
+                                # Note: If auditwheel produced two wheels, it's because the earlier produced wheel
+                                # conforms to multiple manylinux standards. These multiple versions of the wheel are
+                                # functionally the same, differing only in name, wheel metadata, and possibly include
+                                # different external shared libraries. so it doesn't matter which one we run the tests on.
+                                # Let's just pick the first one.
+                                wheel_to_test = repaired_wheels[0]
+                                docker.call(
+                                    ["pip", "install", str(wheel_to_test) + options.test_extras],
+                                    env=virtualenv_env,
+                                )
+
+                                # Install any requirements to run the tests
+                                if options.test_requires:
+                                    docker.call(
+                                        ["pip", "install", *options.test_requires], env=virtualenv_env
+                                    )
+
+                                # Run the tests from a different directory
+                                test_command_prepared = prepare_command(
+                                    options.test_command,
+                                    project=container_project_path,
+                                    package=container_package_dir,
+                                )
+                                docker.call(
+                                    ["sh", "-c", test_command_prepared], cwd="/root", env=virtualenv_env
+                                )
+
+                                # clean up test environment
+                                docker.call(["rm", "-rf", venv_dir])
 
                     # move repaired wheels to output
                     docker.call(["mkdir", "-p", container_output_dir])

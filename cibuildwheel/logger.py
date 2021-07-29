@@ -192,6 +192,8 @@ def build_description_from_identifier(identifier: str) -> str:
         build_description += "CPython"
     elif python_interpreter == "pp":
         build_description += "PyPy"
+    elif python_interpreter == "xc":
+        build_description += "CPython(cross compile)"
     else:
         raise Exception("unknown python")
 
