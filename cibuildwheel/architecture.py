@@ -6,7 +6,7 @@ from typing import Set
 
 from .typing import Literal, PlatformName, assert_never
 
-PRETTY_NAMES = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
+PRETTY_NAMES = {"linux": "Linux", "crosslinux": "CrossLinux", "macos": "macOS", "windows": "Windows"}
 
 
 @functools.total_ordering
@@ -57,6 +57,10 @@ class Architecture(Enum):
         native_architecture = Architecture(platform_module.machine())
         result = {native_architecture}
 
+        if platform == "crosslinux":
+            result.add(Architecture.aarch64)
+            result.remove(native_architecture)
+
         if platform == "linux" and native_architecture == Architecture.x86_64:
             # x86_64 machines can run i686 docker containers
             result.add(Architecture.i686)
@@ -79,6 +83,10 @@ class Architecture(Enum):
                 Architecture.aarch64,
                 Architecture.ppc64le,
                 Architecture.s390x,
+            }
+        elif platform == "crosslinux":
+            return {
+                Architecture.aarch64,
             }
         elif platform == "macos":
             return {Architecture.x86_64, Architecture.arm64, Architecture.universal2}
